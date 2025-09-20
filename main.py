@@ -44,6 +44,10 @@ def top1(probs: Dict[str, float]) -> str:
 # 若不同，請在下方 call_* 函式改成你的實際格式。
 
 async def call_text_api(client: httpx.AsyncClient, text: str) -> Dict[str, float]:
+    if not TEXT_API_BASE:
+
+        return {}
+
     headers = {}
     if TEXT_API_AUTH_HEADER and TEXT_API_AUTH_VALUE:
         headers[TEXT_API_AUTH_HEADER] = TEXT_API_AUTH_VALUE
@@ -60,7 +64,12 @@ async def call_text_api(client: httpx.AsyncClient, text: str) -> Dict[str, float
                 raise
     return {}
 
-async def call_audio_api(client: httpx.AsyncClient, file: UploadFile) -> Dict[str, float]:
+async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) -> Dict[str, float]:
+
+    if not AUDIO_API_BASE or file is None:
+
+        return {}
+
     headers = {}
     if AUDIO_API_AUTH_HEADER and AUDIO_API_AUTH_VALUE:
         headers[AUDIO_API_AUTH_HEADER] = AUDIO_API_AUTH_VALUE
