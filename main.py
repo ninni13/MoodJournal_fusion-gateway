@@ -31,6 +31,41 @@ def normalize(probs: Optional[Dict[str, float]]) -> Dict[str, float]:
         return {"pos": 0.0, "neu": 1.0, "neg": 0.0}
     return {k: float(probs.get(k, 0.0)) / total for k in LABELS}
 
+
+def to_pos_neu_neg(probs: Optional[Dict[str, float]]) -> Dict[str, float]:
+    """接受 {positive/neutral/negative} 或 {pos/neu/neg}，統一轉成 {pos, neu, neg}。"""
+    if not isinstance(probs, dict):
+        return {}
+    if {"pos", "neu", "neg"} <= probs.keys():
+        return {
+            "pos": float(probs.get("pos", 0.0)),
+            "neu": float(probs.get("neu", 0.0)),
+            "neg": float(probs.get("neg", 0.0)),
+        }
+    mapping = {"positive": "pos", "neutral": "neu", "negative": "neg"}
+    out = {"pos": 0.0, "neu": 0.0, "neg": 0.0}
+    for key, value in probs.items():
+        short = mapping.get(key)
+        if short:
+            try:
+                out[short] = float(value)
+            except (TypeError, ValueError):
+                out[short] = 0.0
+    return out
+
+
+def is_neutral_default(probs: Optional[Dict[str, float]]) -> bool:
+    if not probs or not isinstance(probs, dict):
+        return True
+    total = float(probs.get("pos", 0.0) + probs.get("neu", 0.0) + probs.get("neg", 0.0))
+    if total <= 0:
+        return True
+    return (
+        abs(probs.get("pos", 0.0)) < 1e-9
+        and abs(probs.get("neg", 0.0)) < 1e-9
+        and abs(probs.get("neu", 1.0) - 1.0) < 1e-9
+    )
+
 def fuse(text_probs: Dict[str, float], audio_probs: Dict[str, float], alpha: float) -> Dict[str, float]:
     t = normalize(text_probs)
     a = normalize(audio_probs)
@@ -57,10 +92,14 @@ async def call_text_api(client: httpx.AsyncClient, text: str) -> Dict[str, float
     url = f"{TEXT_API_BASE}/infer"
     try:
         r = await client.post(url, json={"text": text}, headers=headers, timeout=20)
-        if r.status_code == 200:
-            j = r.json()
-            return j.get("probs", {})
-    except Exception:
+        if r.status_code != 200:
+            print('[fusion] text infer non-200:', r.status_code)
+            return {}
+        j = r.json()
+        raw = j.get('probs') or j
+        return to_pos_neu_neg(raw)
+    except Exception as exc:
+        print('[fusion] text infer error:', repr(exc))
         return {}
     return {}
 
@@ -78,13 +117,15 @@ async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) 
         return {}
 
     url = f"{AUDIO_API_BASE}/infer"
-    files = {"file": (file.filename or "audio.webm", content, file.content_type or "audio/webm")}
+    files = {"file": (file.filename or "note.webm", content, file.content_type or "audio/webm")}
     try:
         r = await client.post(url, files=files, headers=headers, timeout=40)
-        if r.status_code == 200:
-            j = r.json()
-            return j.get("probs", {})
-        print('[fusion] audio infer non-200:', r.status_code, str(r.text)[:200])
+        if r.status_code != 200:
+            print('[fusion] audio infer non-200:', r.status_code, str(r.text)[:200])
+            return {}
+        j = r.json()
+        raw = j.get('probs') or j
+        return to_pos_neu_neg(raw)
     except Exception as exc:
         print('[fusion] audio infer error:', repr(exc))
     return {}
@@ -140,9 +181,13 @@ async def predict_fusion(
         audio_probs = {}
         alpha = 1.0
 
-    if not audio_probs:
+    audio_is_neutral = is_neutral_default(audio_probs)
+    text_is_neutral = is_neutral_default(text_probs)
+
+    if audio_is_neutral:
+        audio_probs = {}
         alpha = 1.0
-    if not text_probs:
+    elif text_is_neutral:
         alpha = 0.0
 
     text_probs_n = normalize(text_probs)
