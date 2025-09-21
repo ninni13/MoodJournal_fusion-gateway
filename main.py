@@ -45,47 +45,43 @@ def top1(probs: Dict[str, float]) -> str:
 
 async def call_text_api(client: httpx.AsyncClient, text: str) -> Dict[str, float]:
     if not TEXT_API_BASE:
-
         return {}
 
-    headers = {}
+    headers: Dict[str, str] = {}
     if TEXT_API_AUTH_HEADER and TEXT_API_AUTH_VALUE:
         headers[TEXT_API_AUTH_HEADER] = TEXT_API_AUTH_VALUE
 
-    url = f"{TEXT_API_BASE}/predict-text"
-    for attempt in range(2):  # 簡易 retry 1 次
-        try:
-            r = await client.post(url, json={"text": text}, headers=headers, timeout=20)
-            if r.status_code == 200:
-                j = r.json()
-                return j.get("probs", {})
-        except Exception:
-            if attempt == 1:
-                raise
+    url = f"{TEXT_API_BASE}/infer"
+    try:
+        r = await client.post(url, json={"text": text}, headers=headers, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            return j.get("probs", {})
+    except Exception:
+        return {}
     return {}
 
 async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) -> Dict[str, float]:
-
     if not AUDIO_API_BASE or file is None:
-
         return {}
 
-    headers = {}
+    headers: Dict[str, str] = {}
     if AUDIO_API_AUTH_HEADER and AUDIO_API_AUTH_VALUE:
         headers[AUDIO_API_AUTH_HEADER] = AUDIO_API_AUTH_VALUE
 
-    url = f"{AUDIO_API_BASE}/predict-audio"
     content = await file.read()
+    if not content:
+        return {}
+
+    url = f"{AUDIO_API_BASE}/infer"
     files = {"file": (file.filename or "audio.wav", content, file.content_type or "audio/wav")}
-    for attempt in range(2):
-        try:
-            r = await client.post(url, files=files, headers=headers, timeout=30)
-            if r.status_code == 200:
-                j = r.json()
-                return j.get("probs", {})
-        except Exception:
-            if attempt == 1:
-                raise
+    try:
+        r = await client.post(url, files=files, headers=headers, timeout=30)
+        if r.status_code == 200:
+            j = r.json()
+            return j.get("probs", {})
+    except Exception:
+        return {}
     return {}
 
 # === FastAPI App ===
@@ -117,37 +113,35 @@ async def healthz():
 
 @app.post("/predict-fusion", response_model=FusionResponse)
 async def predict_fusion(
-    text: str = Form(...),
-    file: UploadFile = File(...),
-    alpha: float = Form(DEFAULT_ALPHA)
+    text: str = Form(""),
+    file: Optional[UploadFile] = File(None),
+    alpha: float = Form(DEFAULT_ALPHA),
 ):
-    # 基本防呆
     try:
         alpha = max(0.0, min(1.0, float(alpha)))
     except Exception:
         alpha = DEFAULT_ALPHA
 
     async with httpx.AsyncClient() as client:
-        text_task = call_text_api(client, text)
-        audio_task = call_audio_api(client, file)
+        text_task = call_text_api(client, text or "")
+        audio_task = call_audio_api(client, file) if file is not None else asyncio.sleep(0, result={})
         text_probs, audio_probs = await asyncio.gather(text_task, audio_task)
 
-    # 容錯：若其中一邊失敗，退回另一模態；若兩邊都失敗，就給中立
     if not text_probs and not audio_probs:
-        text_probs  = {"pos":0.0, "neu":1.0, "neg":0.0}
-        audio_probs = {"pos":0.0, "neu":1.0, "neg":0.0}
+        text_probs = {"pos": 0.0, "neu": 1.0, "neg": 0.0}
+        audio_probs = {"pos": 0.0, "neu": 1.0, "neg": 0.0}
         alpha = 0.5
 
-    if not text_probs:
-        text_probs = {"pos":0.0, "neu":1.0, "neg":0.0}
-        alpha = 0.0  # 強迫採用音訊結果
     if not audio_probs:
-        audio_probs = {"pos":0.0, "neu":1.0, "neg":0.0}
-        alpha = 1.0  # 強迫採用文字結果
+        alpha = 1.0
+    if not text_probs:
+        text_probs = {"pos": 0.0, "neu": 1.0, "neg": 0.0}
+        alpha = 0.0
 
-    text_probs_n  = normalize(text_probs)
-    audio_probs_n = normalize(audio_probs)
-    fusion_probs  = fuse(text_probs_n, audio_probs_n, alpha)
+    text_probs_n = normalize(text_probs)
+    audio_source = audio_probs if audio_probs else {"pos": 0.0, "neu": 1.0, "neg": 0.0}
+    audio_probs_n = normalize(audio_source)
+    fusion_probs = fuse(text_probs_n, audio_probs_n, alpha)
 
     return FusionResponse(
         text_pred=text_probs_n,
