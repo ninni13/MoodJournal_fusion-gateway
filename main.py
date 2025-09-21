@@ -17,7 +17,11 @@ TEXT_API_AUTH_VALUE   = os.getenv("TEXT_API_AUTH_VALUE", "")
 AUDIO_API_AUTH_HEADER = os.getenv("AUDIO_API_AUTH_HEADER", "")
 AUDIO_API_AUTH_VALUE  = os.getenv("AUDIO_API_AUTH_VALUE", "")
 
-DEFAULT_ALPHA = float(os.getenv("DEFAULT_ALPHA", "0.5"))
+DEFAULT_ALPHA = float(os.getenv("DEFAULT_ALPHA", "0.75"))
+BASE_THRESHOLD = float(os.getenv("FUSION_THRESHOLD", "0.65"))
+TEXT_THRESHOLD = float(os.getenv("TEXT_THRESHOLD", str(BASE_THRESHOLD)))
+AUDIO_THRESHOLD = float(os.getenv("AUDIO_THRESHOLD", str(BASE_THRESHOLD)))
+FUSION_THRESHOLD = float(os.getenv("FUSION_FUSE_THRESHOLD", str(BASE_THRESHOLD)))
 
 # CORS
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -54,6 +58,15 @@ def to_pos_neu_neg(probs: Optional[Dict[str, float]]) -> Dict[str, float]:
     return out
 
 
+def apply_threshold(probs: Optional[Dict[str, float]], threshold: float = BASE_THRESHOLD):
+    converted = to_pos_neu_neg(probs)
+    normalized = normalize(converted)
+    top = max(normalized, key=normalized.get)
+    if normalized[top] < threshold:
+        return 'neu', {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+    return top, normalized
+
+
 def is_neutral_default(probs: Optional[Dict[str, float]]) -> bool:
     if not probs or not isinstance(probs, dict):
         return True
@@ -71,6 +84,13 @@ def fuse(text_probs: Dict[str, float], audio_probs: Dict[str, float], alpha: flo
     a = normalize(audio_probs)
     f = {k: alpha * t[k] + (1 - alpha) * a[k] for k in LABELS}
     return normalize(f)
+
+def fusion_with_threshold(text_probs: Dict[str, float], audio_probs: Dict[str, float], alpha: float, threshold: float = FUSION_THRESHOLD):
+    fused = {k: alpha * text_probs.get(k, 0.0) + (1 - alpha) * audio_probs.get(k, 0.0) for k in LABELS}
+    top = max(fused, key=fused.get)
+    if fused[top] < threshold:
+        return 'neu', fused
+    return top, fused
 
 def top1(probs: Dict[str, float]) -> str:
     return max(LABELS, key=lambda k: probs.get(k, 0.0))
@@ -97,7 +117,8 @@ async def call_text_api(client: httpx.AsyncClient, text: str) -> Dict[str, float
             return {}
         j = r.json()
         raw = j.get('probs') or j
-        return to_pos_neu_neg(raw)
+        _, filtered = apply_threshold(raw, TEXT_THRESHOLD)
+        return filtered
     except Exception as exc:
         print('[fusion] text infer error:', repr(exc))
         return {}
@@ -125,7 +146,8 @@ async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) 
             return {}
         j = r.json()
         raw = j.get('probs') or j
-        return to_pos_neu_neg(raw)
+        _, filtered = apply_threshold(raw, AUDIO_THRESHOLD)
+        return filtered
     except Exception as exc:
         print('[fusion] audio infer error:', repr(exc))
     return {}
@@ -193,10 +215,7 @@ async def predict_fusion(
     text_probs_n = normalize(text_probs)
     audio_probs_n = normalize(audio_probs if audio_probs else None)
 
-    fusion_probs = {
-        k: alpha * text_probs_n[k] + (1 - alpha) * audio_probs_n[k]
-        for k in ('pos', 'neu', 'neg')
-    }
+    fusion_top, fusion_probs = fusion_with_threshold(text_probs_n, audio_probs_n, alpha, FUSION_THRESHOLD)
 
     return FusionResponse(
         text_pred=text_probs_n,
@@ -204,7 +223,7 @@ async def predict_fusion(
         fusion_pred=fusion_probs,
         text_top1=top1(text_probs_n),
         audio_top1=top1(audio_probs_n),
-        fusion_top1=top1(fusion_probs),
+        fusion_top1=fusion_top,
         alpha=alpha,
         labels=LABELS,
     )
