@@ -24,9 +24,12 @@ origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.stri
 
 LABELS: List[str] = ["pos", "neu", "neg"]  # 務必與兩個模型一致
 
-def normalize(probs: Dict[str, float]) -> Dict[str, float]:
-    s = sum(probs.get(k, 0.0) for k in LABELS) or 1.0
-    return {k: (probs.get(k, 0.0) / s) for k in LABELS}
+def normalize(probs: Optional[Dict[str, float]]) -> Dict[str, float]:
+    probs = probs or {}
+    total = float(sum(probs.get(k, 0.0) for k in LABELS))
+    if total <= 0:
+        return {"pos": 0.0, "neu": 1.0, "neg": 0.0}
+    return {k: float(probs.get(k, 0.0)) / total for k in LABELS}
 
 def fuse(text_probs: Dict[str, float], audio_probs: Dict[str, float], alpha: float) -> Dict[str, float]:
     t = normalize(text_probs)
@@ -71,17 +74,19 @@ async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) 
 
     content = await file.read()
     if not content:
+        print('[fusion] audio empty')
         return {}
 
     url = f"{AUDIO_API_BASE}/infer"
-    files = {"file": (file.filename or "audio.wav", content, file.content_type or "audio/wav")}
+    files = {"file": (file.filename or "audio.webm", content, file.content_type or "audio/webm")}
     try:
-        r = await client.post(url, files=files, headers=headers, timeout=30)
+        r = await client.post(url, files=files, headers=headers, timeout=40)
         if r.status_code == 200:
             j = r.json()
             return j.get("probs", {})
-    except Exception:
-        return {}
+        print('[fusion] audio infer non-200:', r.status_code, str(r.text)[:200])
+    except Exception as exc:
+        print('[fusion] audio infer error:', repr(exc))
     return {}
 
 # === FastAPI App ===
@@ -122,6 +127,9 @@ async def predict_fusion(
     except Exception:
         alpha = DEFAULT_ALPHA
 
+    print('[fusion] text_len:', len(text or ''))
+    print('[fusion] file:', None if file is None else (file.filename, file.content_type))
+
     async with httpx.AsyncClient() as client:
         text_task = call_text_api(client, text or "")
         audio_task = call_audio_api(client, file) if file is not None else asyncio.sleep(0, result={})
@@ -129,23 +137,25 @@ async def predict_fusion(
 
     if not text_probs and not audio_probs:
         text_probs = {"pos": 0.0, "neu": 1.0, "neg": 0.0}
-        audio_probs = {"pos": 0.0, "neu": 1.0, "neg": 0.0}
-        alpha = 0.5
+        audio_probs = {}
+        alpha = 1.0
 
     if not audio_probs:
         alpha = 1.0
     if not text_probs:
-        text_probs = {"pos": 0.0, "neu": 1.0, "neg": 0.0}
         alpha = 0.0
 
     text_probs_n = normalize(text_probs)
-    audio_source = audio_probs if audio_probs else {"pos": 0.0, "neu": 1.0, "neg": 0.0}
-    audio_probs_n = normalize(audio_source)
-    fusion_probs = fuse(text_probs_n, audio_probs_n, alpha)
+    audio_probs_n = normalize(audio_probs if audio_probs else None)
+
+    fusion_probs = {
+        k: alpha * text_probs_n[k] + (1 - alpha) * audio_probs_n[k]
+        for k in ('pos', 'neu', 'neg')
+    }
 
     return FusionResponse(
         text_pred=text_probs_n,
-        audio_pred=audio_probs_n,
+        audio_pred=audio_probs_n if audio_probs else {'pos': 0.0, 'neu': 1.0, 'neg': 0.0},
         fusion_pred=fusion_probs,
         text_top1=top1(text_probs_n),
         audio_top1=top1(audio_probs_n),
