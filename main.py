@@ -20,8 +20,11 @@ AUDIO_API_AUTH_VALUE  = os.getenv("AUDIO_API_AUTH_VALUE", "")
 DEFAULT_ALPHA = float(os.getenv("DEFAULT_ALPHA", "0.75"))
 BASE_THRESHOLD = float(os.getenv("FUSION_THRESHOLD", "0.65"))
 TEXT_THRESHOLD = float(os.getenv("TEXT_THRESHOLD", str(BASE_THRESHOLD)))
-AUDIO_THRESHOLD = float(os.getenv("AUDIO_THRESHOLD", str(BASE_THRESHOLD)))
 FUSION_THRESHOLD = float(os.getenv("FUSION_FUSE_THRESHOLD", str(BASE_THRESHOLD)))
+AUDIO_T_POS = float(os.getenv("AUDIO_T_POS", "0.55"))
+AUDIO_T_NEG = float(os.getenv("AUDIO_T_NEG", "0.80"))
+AUDIO_MIN_CONF = float(os.getenv("AUDIO_MIN_CONF", "0.60"))
+AUDIO_MARGIN = float(os.getenv("AUDIO_MARGIN", "0.15"))
 
 # CORS
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -65,6 +68,37 @@ def apply_threshold(probs: Optional[Dict[str, float]], threshold: float = BASE_T
     if normalized[top] < threshold:
         return 'neu', {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
     return top, normalized
+
+
+def apply_audio_class_thresholds(
+    probs: Optional[Dict[str, float]],
+    t_pos: float = AUDIO_T_POS,
+    t_neg: float = AUDIO_T_NEG,
+    min_conf: float = AUDIO_MIN_CONF,
+    margin: float = AUDIO_MARGIN,
+) -> Dict[str, float]:
+    if not isinstance(probs, dict):
+        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+
+    normalized = normalize(to_pos_neu_neg(probs))
+    sorted_items = sorted(normalized.items(), key=lambda kv: kv[1], reverse=True)
+    if len(sorted_items) < 2:
+        sorted_items.append(('neu', 0.0))
+    top_label, top_val = sorted_items[0]
+    second_label, second_val = sorted_items[1]
+
+    if top_val < min_conf:
+        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+
+    if top_label == 'neg' and top_val < t_neg:
+        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+    if top_label == 'pos' and top_val < t_pos:
+        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+
+    if (top_val - second_val) < margin:
+        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+
+    return normalized
 
 
 def is_neutral_default(probs: Optional[Dict[str, float]]) -> bool:
@@ -146,8 +180,7 @@ async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) 
             return {}
         j = r.json()
         raw = j.get('probs') or j
-        _, filtered = apply_threshold(raw, AUDIO_THRESHOLD)
-        return filtered
+        return apply_audio_class_thresholds(raw)
     except Exception as exc:
         print('[fusion] audio infer error:', repr(exc))
     return {}
