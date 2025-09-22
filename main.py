@@ -1,6 +1,6 @@
 import os
 import asyncio
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -87,18 +87,21 @@ def apply_audio_class_thresholds(
     top_label, top_val = sorted_items[0]
     second_label, second_val = sorted_items[1]
 
-    if top_val < min_conf:
-        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+    # 若符合條件，才允許輸出負向/正向，否則強制回退中立
+    if top_label == 'neg':
+        if top_val >= t_neg and (top_val - second_val) >= margin:
+            return {'pos':0.0,'neu':0.0,'neg':1.0}   # 直接 hard 判斷為負向
+        else:
+            return {'pos':0.0,'neu':1.0,'neg':0.0}
 
-    if top_label == 'neg' and top_val < t_neg:
-        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
-    if top_label == 'pos' and top_val < t_pos:
-        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
+    if top_label == 'pos':
+        if top_val >= t_pos and (top_val - second_val) >= margin:
+            return {'pos':1.0,'neu':0.0,'neg':0.0}   # 直接 hard 判斷為正向
+        else:
+            return {'pos':0.0,'neu':1.0,'neg':0.0}
 
-    if (top_val - second_val) < margin:
-        return {'pos': 0.0, 'neu': 1.0, 'neg': 0.0}
-
-    return normalized
+    # 其餘 → 視為中立
+    return {'pos':0.0,'neu':1.0,'neg':0.0}
 
 
 def is_neutral_default(probs: Optional[Dict[str, float]]) -> bool:
@@ -135,9 +138,9 @@ def top1(probs: Dict[str, float]) -> str:
 #   POST {AUDIO_API_BASE}/predict-audio form-data: file -> {"probs": {"pos":0.4,"neu":0.4,"neg":0.2}}
 # 若不同，請在下方 call_* 函式改成你的實際格式。
 
-async def call_text_api(client: httpx.AsyncClient, text: str) -> Dict[str, float]:
+async def call_text_api(client: httpx.AsyncClient, text: str) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
     if not TEXT_API_BASE:
-        return {}
+        return ({'pos': 0.0, 'neu': 1.0, 'neg': 0.0}, [])
 
     headers: Dict[str, str] = {}
     if TEXT_API_AUTH_HEADER and TEXT_API_AUTH_VALUE:
@@ -148,15 +151,26 @@ async def call_text_api(client: httpx.AsyncClient, text: str) -> Dict[str, float
         r = await client.post(url, json={"text": text}, headers=headers, timeout=20)
         if r.status_code != 200:
             print('[fusion] text infer non-200:', r.status_code)
-            return {}
+            return ({'pos': 0.0, 'neu': 1.0, 'neg': 0.0}, [])
         j = r.json()
         raw = j.get('probs') or j
         _, filtered = apply_threshold(raw, TEXT_THRESHOLD)
-        return filtered
+        tokens = j.get('top_tokens') or j.get('tokens') or []
+        if isinstance(tokens, list):
+            sanitized_tokens = []
+            for item in tokens:
+                if isinstance(item, dict):
+                    sanitized_tokens.append(item)
+                else:
+                    sanitized_tokens.append({'text': str(item)})
+            sanitized_tokens = sanitized_tokens[:5]
+        else:
+            sanitized_tokens = []
+        return (filtered, sanitized_tokens)
     except Exception as exc:
         print('[fusion] text infer error:', repr(exc))
-        return {}
-    return {}
+        return ({'pos': 0.0, 'neu': 1.0, 'neg': 0.0}, [])
+    return ({'pos': 0.0, 'neu': 1.0, 'neg': 0.0}, [])
 
 async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) -> Dict[str, float]:
     if not AUDIO_API_BASE or file is None:
@@ -206,6 +220,7 @@ class FusionResponse(BaseModel):
     fusion_top1: str = "pos"
     alpha: float = 0.5
     labels: List[str] = LABELS
+    text_top_tokens: List[Dict[str, Any]] = Field(default_factory=list)
 
 @app.get("/healthz")
 async def healthz():
@@ -229,12 +244,14 @@ async def predict_fusion(
     async with httpx.AsyncClient() as client:
         text_task = call_text_api(client, text or "")
         audio_task = call_audio_api(client, file) if file is not None else asyncio.sleep(0, result={})
-        text_probs, audio_probs = await asyncio.gather(text_task, audio_task)
+        (text_probs, text_tokens), audio_probs = await asyncio.gather(text_task, audio_task)
+    text_tokens = text_tokens or []
 
     if not text_probs and not audio_probs:
         text_probs = {"pos": 0.0, "neu": 1.0, "neg": 0.0}
         audio_probs = {}
         alpha = 1.0
+        text_tokens = []
 
     audio_is_neutral = is_neutral_default(audio_probs)
     text_is_neutral = is_neutral_default(text_probs)
@@ -259,4 +276,5 @@ async def predict_fusion(
         fusion_top1=fusion_top,
         alpha=alpha,
         labels=LABELS,
+        text_top_tokens=text_tokens,
     )
