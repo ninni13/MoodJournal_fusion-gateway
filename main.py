@@ -1,6 +1,9 @@
 import os
 import asyncio
+import mimetypes
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -16,6 +19,8 @@ TEXT_API_AUTH_HEADER  = os.getenv("TEXT_API_AUTH_HEADER", "")
 TEXT_API_AUTH_VALUE   = os.getenv("TEXT_API_AUTH_VALUE", "")
 AUDIO_API_AUTH_HEADER = os.getenv("AUDIO_API_AUTH_HEADER", "")
 AUDIO_API_AUTH_VALUE  = os.getenv("AUDIO_API_AUTH_VALUE", "")
+
+AUDIO_SAVE_DIR = os.getenv("AUDIO_SAVE_DIR", "saved_audio")
 
 DEFAULT_ALPHA = float(os.getenv("DEFAULT_ALPHA", "0.75"))
 BASE_THRESHOLD = float(os.getenv("FUSION_THRESHOLD", "0.65"))
@@ -172,7 +177,11 @@ async def call_text_api(client: httpx.AsyncClient, text: str) -> Tuple[Dict[str,
         return ({'pos': 0.0, 'neu': 1.0, 'neg': 0.0}, [])
     return ({'pos': 0.0, 'neu': 1.0, 'neg': 0.0}, [])
 
-async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) -> Dict[str, float]:
+async def call_audio_api(
+    client: httpx.AsyncClient,
+    file: Optional[UploadFile],
+    content: Optional[bytes] = None,
+) -> Dict[str, float]:
     if not AUDIO_API_BASE or file is None:
         return {}
 
@@ -180,7 +189,8 @@ async def call_audio_api(client: httpx.AsyncClient, file: Optional[UploadFile]) 
     if AUDIO_API_AUTH_HEADER and AUDIO_API_AUTH_VALUE:
         headers[AUDIO_API_AUTH_HEADER] = AUDIO_API_AUTH_VALUE
 
-    content = await file.read()
+    if content is None:
+        content = await file.read()
     if not content:
         print('[fusion] audio empty')
         return {}
@@ -221,6 +231,8 @@ class FusionResponse(BaseModel):
     alpha: float = 0.5
     labels: List[str] = LABELS
     text_top_tokens: List[Dict[str, Any]] = Field(default_factory=list)
+    audio_saved: bool = False
+    audio_path: Optional[str] = None
 
 @app.get("/healthz")
 async def healthz():
@@ -232,6 +244,7 @@ async def predict_fusion(
     text: str = Form(""),
     file: Optional[UploadFile] = File(None),
     alpha: float = Form(DEFAULT_ALPHA),
+    save_audio: bool = Form(True),
 ):
     try:
         alpha = max(0.0, min(1.0, float(alpha)))
@@ -240,10 +253,27 @@ async def predict_fusion(
 
     print('[fusion] text_len:', len(text or ''))
     print('[fusion] file:', None if file is None else (file.filename, file.content_type))
+    print('[fusion] save_audio:', save_audio)
+
+    audio_bytes: Optional[bytes] = None
+    audio_filename: Optional[str] = None
+    audio_content_type: Optional[str] = None
+    if file is not None:
+        audio_bytes = await file.read()
+        audio_filename = file.filename or "note.webm"
+        audio_content_type = file.content_type or "audio/webm"
+        try:
+            await file.seek(0)
+        except Exception:
+            pass
 
     async with httpx.AsyncClient() as client:
         text_task = call_text_api(client, text or "")
-        audio_task = call_audio_api(client, file) if file is not None else asyncio.sleep(0, result={})
+        audio_task = (
+            call_audio_api(client, file, audio_bytes)
+            if file is not None and audio_bytes
+            else asyncio.sleep(0, result={})
+        )
         (text_probs, text_tokens), audio_probs = await asyncio.gather(text_task, audio_task)
     text_tokens = text_tokens or []
 
@@ -267,6 +297,28 @@ async def predict_fusion(
 
     fusion_top, fusion_probs = fusion_with_threshold(text_probs_n, audio_probs_n, alpha, FUSION_THRESHOLD)
 
+    audio_saved = False
+    audio_path: Optional[str] = None
+    if save_audio and audio_bytes:
+        try:
+            os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
+            base_name = audio_filename or "note.webm"
+            ext = os.path.splitext(base_name)[1]
+            if not ext:
+                guessed = mimetypes.guess_extension(audio_content_type or "")
+                ext = guessed or ".webm"
+            filename = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid4().hex}{ext}"
+            path = os.path.join(AUDIO_SAVE_DIR, filename)
+            with open(path, 'wb') as fh:
+                fh.write(audio_bytes)
+            audio_saved = True
+            audio_path = os.path.abspath(path)
+        except Exception as exc:
+            audio_saved = False
+            audio_path = None
+            print('[fusion] save audio failed:', repr(exc))
+    audio_bytes = None
+
     return FusionResponse(
         text_pred=text_probs_n,
         audio_pred=audio_probs_n if audio_probs else {'pos': 0.0, 'neu': 1.0, 'neg': 0.0},
@@ -277,4 +329,6 @@ async def predict_fusion(
         alpha=alpha,
         labels=LABELS,
         text_top_tokens=text_tokens,
+        audio_saved=audio_saved,
+        audio_path=audio_path,
     )
